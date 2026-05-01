@@ -829,7 +829,7 @@ COMMANDS:
         --orchestrate         Enable orchestration: Claude can spawn fanouts/QA itself
         --dir <directory>     Set working directory (default: current)
 
-    list                      List all active sessions (and parent fanouts, if any)
+    list                      List all active sessions (including fanout workers)
 
     kill <name>               Terminate a session OR a fanout (kills its workers + cleans up coord dir)
     kill --all                Terminate all sessions (cleans up all worktrees)
