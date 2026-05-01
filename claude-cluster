@@ -11,6 +11,9 @@ SESSIONS_FILE="$CLUSTER_DIR/sessions.json"
 WORKTREE_BASE="$HOME/.claude/cluster/worktrees"
 CLAUDE_BIN="claude"
 
+# Bump when sessions.json layout changes; add a corresponding block in migrate_sessions.
+SCHEMA_VERSION=1
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,12 +46,38 @@ check_jq() {
     fi
 }
 
-# Initialize sessions file if it doesn't exist
+# Initialize sessions file if it doesn't exist (fresh installs jump straight to current schema)
 init_sessions() {
     if [[ ! -f "$SESSIONS_FILE" ]]; then
         mkdir -p "$CLUSTER_DIR"
-        echo '{"sessions": []}' > "$SESSIONS_FILE"
+        jq -n --argjson v "$SCHEMA_VERSION" '{schema_version: $v, sessions: []}' > "$SESSIONS_FILE"
     fi
+}
+
+# Apply pending data migrations to bring sessions.json up to SCHEMA_VERSION.
+# Fresh installs skip this entirely (init_sessions writes the latest layout).
+migrate_sessions() {
+    [[ ! -f "$SESSIONS_FILE" ]] && return 0
+
+    local current
+    current=$(jq -r '.schema_version // 0' "$SESSIONS_FILE" 2>/dev/null || echo 0)
+
+    if (( current >= SCHEMA_VERSION )); then
+        return 0
+    fi
+
+    log_info "Migrating sessions data: v$current -> v$SCHEMA_VERSION"
+
+    if (( current < 1 )); then
+        # 0 -> 1: introduce schema_version field on pre-versioned data
+        jq --argjson v 1 '. + {schema_version: $v}' "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" \
+            && mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
+    fi
+
+    # Future migrations go here, each guarded by `if (( current < N ))`.
+    # Each block must be idempotent and bump nothing else.
+
+    log_success "Migration complete (now at v$SCHEMA_VERSION)"
 }
 
 # Validate session name
@@ -388,6 +417,31 @@ cmd_status() {
     echo ""
 }
 
+# Command: update — pull the repo and re-exec under the new code so migrations apply
+cmd_update() {
+    local script_path repo
+    script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    repo=$(dirname "$script_path")
+
+    if ! git -C "$repo" rev-parse --git-dir > /dev/null 2>&1; then
+        log_error "Not installed from a git clone (no repo at $repo)"
+        log_info  "If you installed by copying the script, pull updates manually."
+        exit 1
+    fi
+
+    if ! git -C "$repo" diff --quiet 2>/dev/null || ! git -C "$repo" diff --cached --quiet 2>/dev/null; then
+        log_warn "Repo has uncommitted changes; refusing to pull"
+        log_info "Resolve them in $repo and re-run: claude-cluster update"
+        exit 1
+    fi
+
+    log_info "Pulling updates from $repo"
+    git -C "$repo" pull --ff-only
+
+    log_info "Reloading to apply data migrations..."
+    exec "$0" __post_update
+}
+
 # Command: help
 cmd_help() {
     cat <<EOF
@@ -408,6 +462,9 @@ COMMANDS:
     kill --all                Terminate all sessions (cleans up all worktrees)
 
     status <name>             Show detailed status of a session
+
+    update                    Pull the latest version of claude-cluster and apply
+                              any pending data migrations (requires git-clone install)
 
     help                      Show this help message
 
@@ -433,7 +490,7 @@ WORKTREES:
     Each instance works in its own directory with its own branch checked out.
 
 MORE INFO:
-    See ~/.claude/cluster/README.md for detailed documentation
+    See README.md in the claude-cluster repository for detailed documentation
 
 EOF
 }
@@ -442,6 +499,7 @@ EOF
 main() {
     check_jq
     init_sessions
+    migrate_sessions
 
     if [[ $# -eq 0 ]]; then
         cmd_help
@@ -463,6 +521,13 @@ main() {
             ;;
         status)
             cmd_status "$@"
+            ;;
+        update)
+            cmd_update "$@"
+            ;;
+        __post_update)
+            log_success "Update complete (schema v$SCHEMA_VERSION)"
+            exit 0
             ;;
         help|--help|-h)
             cmd_help

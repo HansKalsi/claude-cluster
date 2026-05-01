@@ -112,16 +112,46 @@ claude-cluster kill --all
 
 Show details of a single session (PID, branch, started timestamp, working dir, running/not-running).
 
+### `update`
+
+Pull the latest version of `claude-cluster` from the cloned repo and apply any pending data migrations:
+
+```bash
+claude-cluster update
+```
+
+Requires the git-clone install (`install.sh` symlinks the script back to your local clone, so the running script knows where the repo lives). Refuses to pull if the repo has uncommitted changes. If you copied the script in by hand, update manually instead: `cd <your-clone> && git pull`.
+
+After pulling, the script re-execs itself so any new migrations run under the new code.
+
 ### `help`
 
 Print the help text.
 
 ## How it works
 
-- Sessions are tracked in `~/.claude/cluster/sessions.json` (name, PID, branch, started, working dir).
+- Sessions are tracked in `~/.claude/cluster/sessions.json` — `schema_version` plus an array of `{name, pid, branch, started, working_dir}` entries.
 - When you pass `--auto-branch` or `--branch`, the script runs `git worktree add` against the repo you're currently inside, creating `~/.claude/cluster/worktrees/<repo>/<name>/`.
 - A new Terminal window is opened via `osascript`, which `cd`s into the worktree and launches `claude`.
 - `kill` removes the entry, sends signals to the PID, and runs `git worktree remove --force` to clean up.
+- Pending data migrations run on every command via `migrate_sessions` (no-op when state is already at `SCHEMA_VERSION`).
+
+## Updating
+
+`sessions.json` carries a `schema_version` field so the script can migrate local data forward without forcing fresh installs to replay history.
+
+- **Fresh installs** start at the current `SCHEMA_VERSION` directly — `init_sessions` writes the latest layout, no migrations replay.
+- **Existing installs** auto-run any pending migrations (`current_version < SCHEMA_VERSION`) on the next command, or explicitly via `claude-cluster update`.
+
+Migrations live in the `migrate_sessions` function — small, idempotent `jq` transforms guarded by `if (( current < N ))`.
+
+To add a migration:
+
+1. Bump `SCHEMA_VERSION` at the top of the script.
+2. Append a new `if (( current < N ))` block to `migrate_sessions` with the transform.
+3. Update `init_sessions` so a fresh install writes the new layout directly (avoiding the migration on day one).
+
+The fast-path init means the JSON shape lives in two places — `init_sessions` (the target) and the most recent migration block (the transition into it). Keep them in sync when bumping the version.
 
 ## Workflow patterns
 
