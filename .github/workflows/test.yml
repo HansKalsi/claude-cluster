@@ -17,7 +17,11 @@ jobs:
         run: |
           bash -n claude-cluster
           bash -n install.sh
-          bash -n tests/test_schema.sh
+          for f in tests/test_*.sh; do bash -n "$f"; done
 
-      - name: Run migration regression test
-        run: bash tests/test_schema.sh
+      - name: Run all tests
+        run: |
+          for f in tests/test_*.sh; do
+            echo "=== $f ==="
+            bash "$f" || exit 1
+          done

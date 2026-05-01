@@ -9,7 +9,13 @@ set -euo pipefail
 CLUSTER_DIR="$HOME/.claude/cluster"
 SESSIONS_FILE="$CLUSTER_DIR/sessions.json"
 WORKTREE_BASE="$HOME/.claude/cluster/worktrees"
+COORDINATION_DIR="$CLUSTER_DIR/coordination"
 CLAUDE_BIN="claude"
+
+# Resolve the repo dir via the symlink so we can find prompts/.
+# Use BASH_SOURCE (not $0) so REPO_DIR is correct when the script is sourced for tests.
+SCRIPT_PATH=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+REPO_DIR=$(dirname "$SCRIPT_PATH")
 
 # Bump when sessions.json layout changes; add a corresponding block in migrate_sessions.
 SCHEMA_VERSION=1
@@ -101,24 +107,51 @@ is_process_running() {
     ps -p "$pid" > /dev/null 2>&1
 }
 
-# Add session to sessions.json
+# Add session to sessions.json. Optional 5th arg: parent fanout name (for workers/QA).
 add_session() {
     local name="$1"
     local pid="$2"
     local branch="$3"
     local working_dir="$4"
-    local started=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local parent="${5:-}"
+    local started
+    started=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    local new_session=$(jq -n \
-        --arg name "$name" \
-        --arg pid "$pid" \
-        --arg branch "$branch" \
-        --arg dir "$working_dir" \
-        --arg started "$started" \
-        '{name: $name, pid: ($pid|tonumber), branch: $branch, working_dir: $dir, started: $started}')
+    local new_session
+    if [[ -n "$parent" ]]; then
+        new_session=$(jq -n \
+            --arg name "$name" --arg pid "$pid" --arg branch "$branch" \
+            --arg dir "$working_dir" --arg started "$started" --arg parent "$parent" \
+            '{name: $name, pid: ($pid|tonumber), branch: $branch, working_dir: $dir, started: $started, parent: $parent}')
+    else
+        new_session=$(jq -n \
+            --arg name "$name" --arg pid "$pid" --arg branch "$branch" \
+            --arg dir "$working_dir" --arg started "$started" \
+            '{name: $name, pid: ($pid|tonumber), branch: $branch, working_dir: $dir, started: $started}')
+    fi
 
     jq ".sessions += [$new_session]" "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp"
     mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE"
+}
+
+# Substitute {placeholder} markers in a template file with provided values.
+# Usage: substitute_template <template-path> key1 value1 key2 value2 ...
+# Uses bash literal substitution (no regex), so values can contain anything.
+substitute_template() {
+    local template_file="$1"
+    shift
+    if [[ ! -f "$template_file" ]]; then
+        log_error "Template not found: $template_file"
+        return 1
+    fi
+    local content
+    content=$(<"$template_file")
+    while [[ $# -ge 2 ]]; do
+        local key="$1" value="$2"
+        content=${content//"{$key}"/"$value"}
+        shift 2
+    done
+    printf '%s' "$content"
 }
 
 # Remove session from sessions.json
@@ -160,6 +193,7 @@ cmd_start() {
     local name=""
     local branch=""
     local auto_branch=false
+    local orchestrate=false
     local working_dir="$PWD"
 
     # Parse arguments
@@ -171,6 +205,10 @@ cmd_start() {
                 ;;
             --auto-branch)
                 auto_branch=true
+                shift
+                ;;
+            --orchestrate)
+                orchestrate=true
                 shift
                 ;;
             -d|--dir)
@@ -185,7 +223,13 @@ cmd_start() {
     done
 
     if [[ -z "$name" ]]; then
-        log_error "Usage: claude-cluster start <name> [--branch <branch>] [--auto-branch] [--dir <directory>]"
+        log_error "Usage: claude-cluster start <name> [--branch <branch>] [--auto-branch] [--orchestrate] [--dir <directory>]"
+        exit 1
+    fi
+
+    if [[ "$orchestrate" == true && ! -f "$REPO_DIR/prompts/orchestrate.md" ]]; then
+        log_error "Orchestration prompt missing: $REPO_DIR/prompts/orchestrate.md"
+        log_info "Reinstall via the cloned repo if you copied claude-cluster manually."
         exit 1
     fi
 
@@ -256,11 +300,20 @@ cmd_start() {
     log_info "Working directory: $working_dir"
     log_info "Branch: $branch"
 
+    # Build optional --append-system-prompt-file flag for orchestrate mode
+    local sysprompt_flag=""
+    local mode_label=""
+    if [[ "$orchestrate" == true ]]; then
+        sysprompt_flag="--append-system-prompt-file '$REPO_DIR/prompts/orchestrate.md'"
+        mode_label=" (orchestrator)"
+        log_info "Orchestration mode enabled — Claude can spawn fanouts/QA workers"
+    fi
+
     # Use osascript to open new Terminal window/tab
     if [[ "$TERM_PROGRAM" == "Apple_Terminal" ]] || command -v osascript &> /dev/null; then
         osascript <<EOF
 tell application "Terminal"
-    do script "cd '$working_dir' && echo 'Claude Cluster Session: $name' && echo 'Branch: $branch' && echo '' && $CLAUDE_BIN --model claude-opus-4-7 --dangerously-skip-permissions"
+    do script "cd '$working_dir' && echo 'Claude Cluster Session: $name$mode_label' && echo 'Branch: $branch' && echo '' && $CLAUDE_BIN $sysprompt_flag --model claude-opus-4-7 --dangerously-skip-permissions"
     activate
 end tell
 EOF
@@ -338,6 +391,24 @@ cmd_kill() {
         exit 1
     fi
 
+    # Fanout? Kill every child session, then remove the coordination dir.
+    if is_fanout "$name"; then
+        local children
+        children=$(jq -r --arg parent "$name" '.sessions[] | select(.parent == $parent) | .name' "$SESSIONS_FILE" 2>/dev/null || true)
+        local count=0
+        if [[ -n "$children" ]]; then
+            while IFS= read -r child; do
+                [[ -z "$child" ]] && continue
+                cmd_kill "$child" 2>/dev/null || true
+                ((count++))
+            done <<< "$children"
+        fi
+        log_info "Removing fanout coordination dir: $COORDINATION_DIR/$name"
+        rm -rf "$COORDINATION_DIR/$name"
+        log_success "Fanout '$name' killed ($count workers/QA)"
+        return 0
+    fi
+
     if ! session_exists "$name"; then
         log_error "Session '$name' not found"
         exit 1
@@ -387,6 +458,299 @@ cmd_kill() {
     remove_session "$name"
 }
 
+# Helper: name refers to an existing fanout (has a coordination dir + meta.json)
+is_fanout() {
+    [[ -d "$COORDINATION_DIR/$1" && -f "$COORDINATION_DIR/$1/meta.json" ]]
+}
+
+# Command: fanout — spawn N parallel workers, each in its own worktree
+cmd_fanout() {
+    local name=""
+    local task=""
+    local -a approaches=()
+    local base=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --task) task="$2"; shift 2 ;;
+            --approach) approaches+=("$2"); shift 2 ;;
+            --base) base="$2"; shift 2 ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        log_error "Usage: claude-cluster fanout <name> --task \"<task>\" --approach \"<a1>\" [--approach \"<a2>\" ...]"
+        exit 1
+    fi
+    validate_session_name "$name"
+    if [[ -z "$task" ]]; then
+        log_error "--task is required"
+        exit 1
+    fi
+    if (( ${#approaches[@]} < 1 )); then
+        log_error "at least one --approach is required (typical: 2-4)"
+        exit 1
+    fi
+    if (( ${#approaches[@]} > 6 )); then
+        log_warn "Spawning ${#approaches[@]} workers — token cost will scale linearly."
+    fi
+    if [[ ! -f "$REPO_DIR/prompts/worker.md" ]]; then
+        log_error "Worker prompt missing: $REPO_DIR/prompts/worker.md"
+        exit 1
+    fi
+    if is_fanout "$name"; then
+        log_error "Fanout '$name' already exists. Kill it first: claude-cluster kill $name"
+        exit 1
+    fi
+
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        log_error "Run fanout from inside a git repo (we branch off your current branch)."
+        exit 1
+    fi
+
+    local git_root repo_name
+    git_root=$(git rev-parse --show-toplevel)
+    repo_name=$(basename "$git_root")
+
+    if [[ -z "$base" ]]; then
+        base=$(git branch --show-current)
+        if [[ -z "$base" ]]; then
+            log_error "Could not determine current branch; pass --base explicitly."
+            exit 1
+        fi
+    fi
+
+    local coord_root="$COORDINATION_DIR/$name"
+    mkdir -p "$coord_root"
+
+    local approaches_json
+    approaches_json=$(printf '%s\n' "${approaches[@]}" | jq -R . | jq -s .)
+    jq -n \
+        --arg name "$name" --arg task "$task" --arg base "$base" \
+        --arg git_root "$git_root" --arg repo_name "$repo_name" \
+        --argjson approaches "$approaches_json" \
+        --arg started "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        '{type: "fanout", name: $name, task: $task, base: $base, git_root: $git_root, repo_name: $repo_name, approaches: $approaches, started: $started}' \
+        > "$coord_root/meta.json"
+
+    log_info "Fanout '$name': base=$base, ${#approaches[@]} workers"
+
+    local i=1
+    for approach in "${approaches[@]}"; do
+        local worker_name="${name}-w${i}"
+        local worker_branch="claude/${worker_name}"
+        local worker_worktree="$WORKTREE_BASE/$repo_name/$worker_name"
+        local worker_coord="$coord_root/worker-$i"
+
+        mkdir -p "$worker_coord"
+        echo "starting" > "$worker_coord/status"
+        printf '%s' "$approach" > "$worker_coord/approach.txt"
+
+        log_info "  worker $i: $worker_branch -> $worker_worktree"
+
+        if (cd "$git_root" && git show-ref --verify --quiet "refs/heads/$worker_branch"); then
+            (cd "$git_root" && git worktree add "$worker_worktree" "$worker_branch") > /dev/null 2>&1
+        else
+            (cd "$git_root" && git worktree add -b "$worker_branch" "$worker_worktree" "$base") > /dev/null 2>&1
+        fi
+
+        substitute_template "$REPO_DIR/prompts/worker.md" \
+            worker_index "$i" \
+            worker_count "${#approaches[@]}" \
+            worktree "$worker_worktree" \
+            branch "$worker_branch" \
+            base_branch "$base" \
+            coordination_dir "$worker_coord" \
+            approach "$approach" \
+            > "$worker_coord/system-prompt.md"
+
+        # Spawn worker in background; -p mode runs non-interactively and exits when done.
+        (
+            cd "$worker_worktree" || { echo "failed-cd" > "$worker_coord/status"; exit 1; }
+            echo "running" > "$worker_coord/status"
+            "$CLAUDE_BIN" -p "$task" \
+                --append-system-prompt-file "$worker_coord/system-prompt.md" \
+                --model claude-opus-4-7 \
+                --dangerously-skip-permissions \
+                > "$worker_coord/output.log" 2>&1
+            local rc=$?
+            if [[ $rc -eq 0 ]]; then
+                echo "done" > "$worker_coord/status"
+            else
+                echo "failed" > "$worker_coord/status"
+            fi
+        ) &
+        local worker_pid=$!
+
+        add_session "$worker_name" "$worker_pid" "$worker_branch" "$worker_worktree" "$name"
+        ((i++))
+    done
+
+    log_success "Fanout '$name' launched: ${#approaches[@]} workers running in background"
+    log_info "Watch:        claude-cluster status $name"
+    log_info "Coordination: $coord_root"
+}
+
+# Command: qa — spawn a fresh-eyes reviewer over a branch produced by a fanout
+cmd_qa() {
+    local fanout_name=""
+    local branch=""
+    local task=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --branch) branch="$2"; shift 2 ;;
+            --task) task="$2"; shift 2 ;;
+            *) fanout_name="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$fanout_name" || -z "$branch" || -z "$task" ]]; then
+        log_error "Usage: claude-cluster qa <fanout-name> --branch <branch> --task \"<criteria>\""
+        exit 1
+    fi
+    validate_session_name "$fanout_name"
+    if ! is_fanout "$fanout_name"; then
+        log_error "Fanout '$fanout_name' not found at $COORDINATION_DIR/$fanout_name"
+        exit 1
+    fi
+    if [[ ! -f "$REPO_DIR/prompts/qa.md" ]]; then
+        log_error "QA prompt missing: $REPO_DIR/prompts/qa.md"
+        exit 1
+    fi
+
+    local coord_root="$COORDINATION_DIR/$fanout_name"
+    local meta_file="$coord_root/meta.json"
+    local git_root base repo_name
+    git_root=$(jq -r '.git_root' "$meta_file")
+    base=$(jq -r '.base' "$meta_file")
+    repo_name=$(jq -r '.repo_name' "$meta_file")
+
+    if ! (cd "$git_root" && git show-ref --verify --quiet "refs/heads/$branch"); then
+        log_error "Branch '$branch' not found in $git_root"
+        exit 1
+    fi
+
+    local qa_session_name="${fanout_name}-qa"
+    if session_exists "$qa_session_name"; then
+        log_error "QA already running for '$fanout_name'. Kill first: claude-cluster kill $qa_session_name"
+        exit 1
+    fi
+
+    local qa_worktree="$WORKTREE_BASE/$repo_name/$qa_session_name"
+    local qa_coord="$coord_root/qa"
+    mkdir -p "$qa_coord"
+    echo "starting" > "$qa_coord/status"
+    printf '%s' "$branch" > "$qa_coord/branch.txt"
+    printf '%s' "$task" > "$qa_coord/criteria.txt"
+
+    log_info "QA: reviewing $branch (against $base) for fanout '$fanout_name'"
+    (cd "$git_root" && git worktree add "$qa_worktree" "$branch") > /dev/null 2>&1
+
+    substitute_template "$REPO_DIR/prompts/qa.md" \
+        worktree "$qa_worktree" \
+        branch "$branch" \
+        base_branch "$base" \
+        coordination_dir "$qa_coord" \
+        > "$qa_coord/system-prompt.md"
+
+    (
+        cd "$qa_worktree" || { echo "failed-cd" > "$qa_coord/status"; exit 1; }
+        echo "running" > "$qa_coord/status"
+        "$CLAUDE_BIN" -p "$task" \
+            --append-system-prompt-file "$qa_coord/system-prompt.md" \
+            --model claude-opus-4-7 \
+            --dangerously-skip-permissions \
+            > "$qa_coord/output.log" 2>&1
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then
+            echo "done" > "$qa_coord/status"
+        else
+            echo "failed" > "$qa_coord/status"
+        fi
+    ) &
+    local qa_pid=$!
+
+    add_session "$qa_session_name" "$qa_pid" "$branch" "$qa_worktree" "$fanout_name"
+    log_success "QA launched: $qa_session_name (PID $qa_pid)"
+    log_info "Watch: claude-cluster status $fanout_name"
+}
+
+# Helper: emit JSON describing fanout state (workers + QA + meta)
+cmd_status_fanout() {
+    local name="$1"
+    local coord_root="$COORDINATION_DIR/$name"
+    local meta_file="$coord_root/meta.json"
+
+    local workers="[]"
+    local worker_dir
+    for worker_dir in "$coord_root"/worker-*; do
+        [[ -d "$worker_dir" ]] || continue
+        local idx="${worker_dir##*-}"
+        local worker_session_name="${name}-w${idx}"
+
+        local status="unknown"
+        [[ -f "$worker_dir/status" ]] && status=$(cat "$worker_dir/status")
+
+        local pid="" branch="" worktree=""
+        if session_exists "$worker_session_name"; then
+            local s
+            s=$(get_session "$worker_session_name")
+            pid=$(echo "$s" | jq -r '.pid')
+            branch=$(echo "$s" | jq -r '.branch')
+            worktree=$(echo "$s" | jq -r '.working_dir')
+            if [[ "$status" == "running" ]] && ! is_process_running "$pid"; then
+                status="terminated"
+                echo "$status" > "$worker_dir/status"
+            fi
+        fi
+
+        local approach=""
+        [[ -f "$worker_dir/approach.txt" ]] && approach=$(cat "$worker_dir/approach.txt")
+        local summary_path="$worker_dir/summary.md"
+        local summary_exists=false
+        [[ -f "$summary_path" ]] && summary_exists=true
+
+        workers=$(echo "$workers" | jq \
+            --arg idx "$idx" --arg status "$status" --arg pid "$pid" \
+            --arg branch "$branch" --arg worktree "$worktree" --arg approach "$approach" \
+            --arg summary_path "$summary_path" --argjson summary_exists "$summary_exists" \
+            '. + [{index: ($idx|tonumber), status: $status, pid: $pid, branch: $branch, worktree: $worktree, approach: $approach, summary_path: $summary_path, summary_exists: $summary_exists}]')
+    done
+
+    local qa_obj='null'
+    if [[ -d "$coord_root/qa" ]]; then
+        local qa_session_name="${name}-qa"
+        local qa_status="unknown"
+        [[ -f "$coord_root/qa/status" ]] && qa_status=$(cat "$coord_root/qa/status")
+        local qa_pid=""
+        if session_exists "$qa_session_name"; then
+            qa_pid=$(get_session "$qa_session_name" | jq -r '.pid')
+            if [[ "$qa_status" == "running" ]] && ! is_process_running "$qa_pid"; then
+                qa_status="terminated"
+                echo "$qa_status" > "$coord_root/qa/status"
+            fi
+        fi
+        local qa_branch=""
+        [[ -f "$coord_root/qa/branch.txt" ]] && qa_branch=$(cat "$coord_root/qa/branch.txt")
+        local qa_summary_path="$coord_root/qa/summary.md"
+        local qa_summary_exists=false
+        [[ -f "$qa_summary_path" ]] && qa_summary_exists=true
+        qa_obj=$(jq -n \
+            --arg status "$qa_status" --arg pid "$qa_pid" --arg branch "$qa_branch" \
+            --arg summary_path "$qa_summary_path" --argjson summary_exists "$qa_summary_exists" \
+            '{status: $status, pid: $pid, branch: $branch, summary_path: $summary_path, summary_exists: $summary_exists}')
+    fi
+
+    jq -n \
+        --argjson meta "$(cat "$meta_file")" \
+        --argjson workers "$workers" \
+        --argjson qa "$qa_obj" \
+        --arg coord "$coord_root" \
+        '{type: "fanout", meta: $meta, workers: $workers, qa: $qa, coordination_dir: $coord}'
+}
+
 # Command: status
 cmd_status() {
     local name="$1"
@@ -396,8 +760,14 @@ cmd_status() {
         exit 1
     fi
 
+    # Fanout? Emit JSON for the orchestrator to parse.
+    if is_fanout "$name"; then
+        cmd_status_fanout "$name"
+        return
+    fi
+
     if ! session_exists "$name"; then
-        log_error "Session '$name' not found"
+        log_error "Session or fanout '$name' not found"
         exit 1
     fi
 
@@ -406,6 +776,7 @@ cmd_status() {
     local branch=$(echo "$session" | jq -r '.branch')
     local started=$(echo "$session" | jq -r '.started')
     local dir=$(echo "$session" | jq -r '.working_dir')
+    local parent=$(echo "$session" | jq -r '.parent // empty')
 
     echo ""
     echo "Session: $name"
@@ -413,6 +784,7 @@ cmd_status() {
     echo "Branch: $branch"
     echo "Started: $started"
     echo "Working Dir: $dir"
+    [[ -n "$parent" ]] && echo "Parent fanout: $parent"
     echo "Status: $(is_process_running "$pid" && echo "Running" || echo "Not Running")"
     echo ""
 }
@@ -454,14 +826,24 @@ COMMANDS:
     start <name>              Start a new Claude instance with given name
         --branch <branch>     Checkout specific git branch (creates isolated worktree)
         --auto-branch         Auto-create branch claude/<name> (creates isolated worktree)
+        --orchestrate         Enable orchestration: Claude can spawn fanouts/QA itself
         --dir <directory>     Set working directory (default: current)
 
-    list                      List all active sessions
+    list                      List all active sessions (and parent fanouts, if any)
 
-    kill <name>               Terminate a specific session (cleans up worktree)
+    kill <name>               Terminate a session OR a fanout (kills its workers + cleans up coord dir)
     kill --all                Terminate all sessions (cleans up all worktrees)
 
-    status <name>             Show detailed status of a session
+    status <name>             Show details of a session (human-readable) OR fanout (JSON)
+
+    fanout <name>             Spawn N parallel workers, each in its own worktree
+        --task "<task>"       The task all workers must accomplish (required)
+        --approach "<hint>"   Approach hint for one worker (repeatable; one per worker)
+        --base <branch>       Base branch to fork from (default: current branch)
+
+    qa <fanout-name>          Spawn a fresh-eyes reviewer over a branch from a fanout
+        --branch <branch>     Branch to review (required)
+        --task "<criteria>"   Review criteria (required)
 
     update                    Pull the latest version of claude-cluster and apply
                               any pending data migrations (requires git-clone install)
@@ -472,22 +854,35 @@ EXAMPLES:
     # Start instance with auto-created branch (RECOMMENDED - creates isolated worktree)
     claude-cluster start feature-auth --auto-branch
 
-    # Start instance on specific branch (creates isolated worktree)
-    claude-cluster start bugfix-api --branch fix/api-error
+    # Start instance with orchestration capability (Claude can spawn parallel workers)
+    claude-cluster start big-task --auto-branch --orchestrate
 
-    # List all running instances
-    claude-cluster list
+    # Manual fanout: explore three approaches in parallel
+    claude-cluster fanout retry-design \\
+        --task "implement payment retry logic" \\
+        --approach "exponential backoff with jitter" \\
+        --approach "fixed retry with circuit breaker" \\
+        --approach "queue-based retry with workers"
 
-    # Kill specific instance (removes worktree)
-    claude-cluster kill feature-auth
+    # Watch a fanout (returns JSON)
+    claude-cluster status retry-design
 
-    # Kill all instances (removes all worktrees)
-    claude-cluster kill --all
+    # Spawn QA reviewer over a worker's branch
+    claude-cluster qa retry-design --branch claude/retry-design-w1 --task "race conditions and error handling"
+
+    # Kill a fanout (terminates all workers, removes coord dir)
+    claude-cluster kill retry-design
 
 WORKTREES:
     When using --branch or --auto-branch, claude-cluster creates a git worktree
     at ~/.claude/cluster/worktrees/<repo>/<name>/ for true branch isolation.
-    Each instance works in its own directory with its own branch checked out.
+    Fanout workers each get their own worktree under the same path.
+
+ORCHESTRATION:
+    Sessions started with --orchestrate get a system prompt extension allowing
+    them to call \`claude-cluster fanout\`, \`status\`, \`qa\`, and \`kill\` themselves
+    when a task warrants parallel exploration. Workers do NOT get the flag, so
+    recursion is bounded by design.
 
 MORE INFO:
     See README.md in the claude-cluster repository for detailed documentation
@@ -522,6 +917,12 @@ main() {
         status)
             cmd_status "$@"
             ;;
+        fanout)
+            cmd_fanout "$@"
+            ;;
+        qa)
+            cmd_qa "$@"
+            ;;
         update)
             cmd_update "$@"
             ;;
@@ -541,4 +942,7 @@ main() {
     esac
 }
 
-main "$@"
+# Only run main when invoked directly (not when sourced for testing).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
