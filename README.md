@@ -16,7 +16,7 @@ Each Claude Code session is independent: a separate UUID, transcript, and contex
 ## Requirements
 
 - macOS (uses `osascript` to open Terminal windows)
-- bash 4+
+- bash 3.2+ (works with the version macOS ships)
 - [`jq`](https://jqlang.github.io/jq/) — `brew install jq`
 - [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) on `$PATH`
 - A git repository to spawn sessions against
@@ -162,7 +162,7 @@ claude-cluster start projB-task --dir ~/work/projB --auto-branch
 
 The script is short — open `claude-cluster` and tweak directly. The most common knobs:
 
-- **Model / launch flags** — search for `claude --model` in `cmd_start` to change the model or remove flags like `--dangerously-skip-permissions`.
+- **Model / launch flags** — search for `claude-opus-4-7` in `cmd_start` to change the model or remove flags like `--dangerously-skip-permissions`.
 - **State location** — `CLUSTER_DIR` and `WORKTREE_BASE` near the top of the script.
 - **Terminal app** — the `osascript` block targets `Terminal`. Swap for iTerm2 if preferred.
 

@@ -231,7 +231,7 @@ cmd_start() {
     if [[ "$TERM_PROGRAM" == "Apple_Terminal" ]] || command -v osascript &> /dev/null; then
         osascript <<EOF
 tell application "Terminal"
-    do script "cd '$working_dir' && echo 'Claude Cluster Session: $name' && echo 'Branch: $branch' && echo '' && $CLAUDE_BIN --model claude-opus-4-6 --dangerously-skip-permissions"
+    do script "cd '$working_dir' && echo 'Claude Cluster Session: $name' && echo 'Branch: $branch' && echo '' && $CLAUDE_BIN --model claude-opus-4-7 --dangerously-skip-permissions"
     activate
 end tell
 EOF
