@@ -150,8 +150,24 @@ To add a migration:
 1. Bump `SCHEMA_VERSION` at the top of the script.
 2. Append a new `if (( current < N ))` block to `migrate_sessions` with the transform.
 3. Update `init_sessions` so a fresh install writes the new layout directly (avoiding the migration on day one).
+4. Run `bash tests/test_schema.sh` — the regression test fails if `init_sessions` and `migrate_sessions` produce different shapes.
 
-The fast-path init means the JSON shape lives in two places — `init_sessions` (the target) and the most recent migration block (the transition into it). Keep them in sync when bumping the version.
+The fast-path init means the JSON shape lives in two places — `init_sessions` (the target) and the most recent migration block (the transition into it). The test in step 4 is what guarantees they stay in sync.
+
+## Tests
+
+```bash
+bash tests/test_schema.sh
+```
+
+Drives the script under a sandboxed `HOME` so each scenario gets a clean state directory. Verifies:
+
+- Fresh installs land at `SCHEMA_VERSION` directly.
+- A legacy (pre-versioned) `sessions.json` migrates to the **same** shape as a fresh install — the assertion that catches "bumped `SCHEMA_VERSION` but forgot to update one side" bugs.
+- Migrations are idempotent on already-current state.
+- Existing session entries survive migration intact.
+
+Requires `jq` and `bash`. No mocking, no external deps. Runs in under a second.
 
 ## Workflow patterns
 
@@ -228,9 +244,11 @@ The script is short — open `claude-cluster` and tweak directly. The most commo
 
 ```
 claude-cluster/
-├── claude-cluster   # the bash script
-├── install.sh       # symlinks the script into $PATH
-├── README.md        # this file
+├── claude-cluster        # the bash script
+├── install.sh            # symlinks the script into $PATH
+├── tests/
+│   └── test_schema.sh    # migration regression test
+├── README.md             # this file
 └── .gitignore
 ```
 
